@@ -1,0 +1,12 @@
+[package]
+name = "sermcs"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+actix-web = "4.5.1"
+tokio = { version = "1.37.0", features = ["full"] }
+tokio-postgres = { version = "0.7.10", features = ["with-chrono-0_4"] }
+reqwest = { version = "0.12.2", features = ["json", "rustls-tls"] }
