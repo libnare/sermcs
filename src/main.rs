@@ -50,6 +50,7 @@ async fn get_thumbnail_image(input_file_path: &str, output: &PathBuf, content_ty
         }
         "image" => {
             ffmpeg_args.extend(&["-vf", VF_THUMBNAIL_IMAGE]);
+            ffmpeg_args.extend(&["-c:v", "librav1e"]);
         }
         _ => {}
     }
