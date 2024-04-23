@@ -46,11 +46,26 @@ impl Default for Bind {
 impl AppState {
     pub async fn new() -> Self {
         let db_config = DbConfig {
-            host: env::var("DB_HOST").unwrap(),
-            port: env::var("DB_PORT").unwrap().parse().unwrap(),
-            user: env::var("DB_USER").unwrap(),
-            password: env::var("DB_PASSWORD").unwrap(),
-            database: env::var("DB_NAME").unwrap(),
+            host: env::var("DB_HOST").unwrap_or_else(|e| {
+                error!("Failed to env DB_HOST: {}", e);
+                exit(1);
+            }),
+            port: env::var("DB_PORT").unwrap_or_else(|e| {
+                error!("Failed to env DB_PORT: {}", e);
+                exit(1);
+            }).parse().unwrap(),
+            user: env::var("DB_USER").unwrap_or_else(|e| {
+                error!("Failed to env DB_USER: {}", e);
+                exit(1);
+            }),
+            password: env::var("DB_PASSWORD").unwrap_or_else(|e| {
+                error!("Failed to env DB_PASSWORD: {}", e);
+                exit(1);
+            }),
+            database: env::var("DB_NAME").unwrap_or_else(|e| {
+                error!("Failed to env DB_NAME: {}", e);
+                exit(1);
+            }),
         };
         let pool = match PgPoolOptions::new()
             .max_connections(5)
@@ -75,7 +90,10 @@ impl AppState {
         Self {
             db_pool: pool,
             http_client: HTTP_CLIENT.clone(),
-            temp_dir: env::var("SERMCS_DIR").unwrap(),
+            temp_dir: env::var("SERMCS_DIR").unwrap_or_else(|e| {
+                error!("Failed to env SERMCS_DIR: {}", e);
+                exit(1);
+            }),
         }
     }
 }
