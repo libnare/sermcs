@@ -1,17 +1,21 @@
+use std::env;
+use std::path::PathBuf;
 use std::io::Write;
-use std::str::FromStr;
 
-use actix_web::{App, get, HttpResponse, HttpServer, web};
-use actix_web::http::header::{HeaderName, HeaderValue};
-use actix_web::http::StatusCode;
+use actix_files::NamedFile;
+use actix_web::{App, Error, error, get, HttpServer, web};
 use actix_web::web::Data;
-use reqwest::header::{CONTENT_DISPOSITION, CONTENT_TYPE};
+use reqwest::header::CONTENT_TYPE;
 use reqwest::Method;
 use sqlx::Row;
 use tempfile::NamedTempFile;
+use tokio::fs::File;
+use tokio::fs;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
+use tokio_stream::StreamExt;
 use tracing::{error, Level};
-use zerocopy::IntoBytes;
+use xxhash_rust::xxh3::xxh3_64;
 
 use sermcs::AppState;
 
@@ -25,15 +29,8 @@ const KEY_QUERY: &str = r#"
     WHERE "accessKey" = $1 OR "thumbnailAccessKey" = $1
     "#;
 
-async fn get_thumbnail_image(input_file_path: &str, content_type: &str, method: &str) -> HttpResponse {
-    let output_file = NamedTempFile::new().unwrap();
-
-    let ct;
-    let status_code;
-
+async fn get_thumbnail_image(input_file_path: &str, output: &PathBuf, content_type: &str, method: &str) -> PathBuf {
     let image_format = content_type.split('/').nth(1).unwrap_or("");
-
-    let output_file_str = output_file.path().to_string_lossy();
 
     let mut ffmpeg_args = vec![
         "-y",
@@ -45,44 +42,32 @@ async fn get_thumbnail_image(input_file_path: &str, content_type: &str, method: 
         "video" => {
             ffmpeg_args.extend(&["-vf", VF_THUMBNAIL_VIDEO]);
             ffmpeg_args.extend(&["-vframes", "1"]);
-        },
+        }
         "animated" => {
             ffmpeg_args.extend(&["-vf", VF_THUMBNAIL_ANIMATED_IMAGE]);
             ffmpeg_args.extend(&["-loop", "0"]);
-        },
+        }
         "image" => {
             ffmpeg_args.extend(&["-vf", VF_THUMBNAIL_IMAGE]);
-        },
+        }
         _ => {}
     }
 
-    ffmpeg_args.push(&output_file_str);
+    ffmpeg_args.push(output.to_str().unwrap());
 
-    let output = Command::new("ffmpeg")
+    let _ = Command::new("ffmpeg")
         .args(&ffmpeg_args)
         .output()
-        .await;
+        .await.map_err(|e| {
+        eprintln!("{}", e);
+        error::ErrorInternalServerError(format!("ffmpeg error: {}", e))
+    });
 
-    match output {
-        Ok(_) => {
-            status_code = StatusCode::OK;
-            ct = content_type
-        }
-        Err(_) => {
-            status_code = StatusCode::INTERNAL_SERVER_ERROR;
-            ct = "text/plain";
-        }
-    }
-
-    let content = web::block(move || std::fs::read(output_file.path())).await.unwrap().unwrap();
-
-    HttpResponse::build(status_code)
-        .content_type(ct)
-        .body(content)
+    PathBuf::from(output)
 }
 
 #[get("/{tail:.*}")]
-async fn detail(key: web::Path<(String, )>, data: Data<AppState>) -> HttpResponse {
+async fn detail(key: web::Path<(String, )>, data: Data<AppState>) -> Result<NamedFile, Error> {
     let key = key.into_inner().0;
 
     let rows = match sqlx::query(KEY_QUERY)
@@ -92,7 +77,7 @@ async fn detail(key: web::Path<(String, )>, data: Data<AppState>) -> HttpRespons
         Ok(rows) => rows,
         Err(e) => {
             error!("Query failed: {e}");
-            return HttpResponse::new(StatusCode::BAD_GATEWAY);
+            return Err(error::ErrorBadGateway(format!("Query failed: {}", e)));
         }
     };
 
@@ -104,57 +89,130 @@ async fn detail(key: web::Path<(String, )>, data: Data<AppState>) -> HttpRespons
     let is_access = access_key == &*key;
     let is_thumbnail = thumbnail_access_key == key;
 
-    let res = match data.http_client.request(Method::GET, url).send().await {
-        Ok(res) => res,
-        Err(_) => return HttpResponse::new(StatusCode::BAD_GATEWAY),
-    };
-
-    let headers = res.headers().clone();
-
-    if let Some(content_type) = headers.get(CONTENT_TYPE) {
-        if file_type != content_type.to_str().unwrap() {
-            return HttpResponse::new(StatusCode::INTERNAL_SERVER_ERROR);
-        }
-    }
-
     return if is_access {
-        let mut http_res = HttpResponse::build(StatusCode::from_u16(res.status().as_u16()).unwrap()).body(res.bytes().await.unwrap());
+        let file_hash = xxh3_64(key.as_ref());
+        let base_dir = &data.temp_dir;
+        let file_path = PathBuf::from(&base_dir).join(file_hash.to_string());
 
-        if let Some(content_type) = headers.get(CONTENT_TYPE) {
-            if file_type != content_type.to_str().unwrap() {
-                return HttpResponse::new(StatusCode::BAD_GATEWAY);
-            }
-            http_res.headers_mut().insert(
-                HeaderName::from_str(CONTENT_TYPE.as_str()).unwrap(),
-                HeaderValue::from_str(content_type.to_str().unwrap()).unwrap(),
-            );
-        }
-        if let Some(content_disposition) = headers.get(CONTENT_DISPOSITION) {
-            http_res.headers_mut().insert(
-                HeaderName::from_str(CONTENT_DISPOSITION.as_str()).unwrap(),
-                HeaderValue::from_str(content_disposition.to_str().unwrap()).unwrap(),
-            );
-        }
+        let ext_hint_path = format!("ext-{}", file_hash);
+        let ext_hint_file = PathBuf::from(&base_dir).join(&ext_hint_path);
+        let check = ext_hint_file.exists();
 
-        http_res
-    } else if is_thumbnail {
-        let res: web::Bytes = res.bytes().await.unwrap();
-
-        let mut input_file = NamedTempFile::new().unwrap();
-        input_file.write(&*res.as_bytes()).unwrap();
-
-        return if file_type.starts_with("video/") {
-            get_thumbnail_image(input_file.path().to_str().unwrap(), "image/avif", "video").await
-        } else if file_type == "image/apng" {
-            get_thumbnail_image(input_file.path().to_str().unwrap(), "image/webp", "animated").await
-        } else if file_type == "image/gif" {
-            get_thumbnail_image(input_file.path().to_str().unwrap(), "image/webp", "animated").await
+        if check {
+            let file = File::open(&ext_hint_file).await.unwrap();
+            let mut reader = BufReader::new(file);
+            let mut ext = String::new();
+            reader.read_line(&mut ext).await?;
+            let file_path_with_ext = if ext.trim() == "None" {
+                file_path.clone()
+            } else {
+                file_path.with_extension(ext.trim())
+            };
+            NamedFile::open(file_path_with_ext).map_err(|e| {
+                eprintln!("{}", e);
+                error::ErrorInternalServerError(format!("Error: {}", e))
+            })
         } else {
-            get_thumbnail_image(input_file.path().to_str().unwrap(), "image/avif", "image").await
+            let mut download = File::create(&file_path).await.unwrap();
+
+            let res = data.http_client.request(Method::GET, url).send().await.unwrap();
+
+            let headers = res.headers().clone();
+            if let Some(content_type) = headers.get(CONTENT_TYPE) {
+                if content_type == "image/png" && file_type == "image/apng" {
+                } else if file_type != content_type.to_str().unwrap() {
+                    return Err(error::ErrorBadGateway("content-type != :failed".to_string()));
+                }
+            }
+
+            let mut stream = res.bytes_stream();
+
+            while let Some(chunk_result) = stream.next().await {
+                let chunk = chunk_result.unwrap();
+                download.write_all(&chunk).await.unwrap();
+            }
+
+            download.flush().await.unwrap();
+
+            let ext = mime_guess::get_mime_extensions_str(&*file_type);
+            let ext_hint_file_path = PathBuf::from(&base_dir).join(&ext_hint_path);
+            let ext_hint_file_path_str = ext_hint_file_path.to_string_lossy().to_string();
+            let new_file_path = if let Some(ext) = ext {
+                let ext = ext[0];
+                let new_file_path_with_ext = format!("{}.{}", file_path.to_string_lossy(), ext);
+                fs::rename(&file_path, &new_file_path_with_ext).await.unwrap();
+                File::create(&ext_hint_file_path_str).await.unwrap().write_all(ext.as_bytes()).await.unwrap();
+                new_file_path_with_ext
+            } else {
+                File::create(&ext_hint_file_path_str).await.unwrap().write_all("None".as_bytes()).await.unwrap();
+                file_path.to_string_lossy().to_string()
+            };
+
+            NamedFile::open(new_file_path).map_err(|e| {
+                eprintln!("{}", e);
+                error::ErrorInternalServerError(format!("Error: {}", e))
+            })
         }
+    } else if is_thumbnail {
+        let file_hash = xxh3_64(format!("{}-thumbnail", key).as_ref());
+        let base_dir = env::var("SERMCS_TEMP_DIR").unwrap_or_else(|_| "C:\\Users\\Iris\\Downloads\\sermcs-temp".to_string());
+
+        let file_path_avif = PathBuf::from(&base_dir).join(format!("{}-thumbnail.avif", file_hash));
+        let file_path_webp = PathBuf::from(&base_dir).join(format!("{}-thumbnail.webp", file_hash));
+
+        let check_avif = file_path_avif.exists();
+        let check_webp = file_path_webp.exists();
+
+        let file_path = if check_avif {
+            file_path_avif
+        } else if check_webp {
+            file_path_webp
+        } else {
+            let mut download = NamedTempFile::new().unwrap();
+
+            let res = data.http_client.request(Method::GET, url).send().await.unwrap();
+
+            let headers = res.headers().clone();
+            if let Some(content_type) = headers.get(CONTENT_TYPE) {
+                if content_type == "image/png" && file_type == "image/apng" {
+                } else if file_type != content_type.to_str().unwrap() {
+                    return Err(error::ErrorBadGateway("content-type != :failed".to_string()));
+                }
+            }
+
+            let mut stream = res.bytes_stream();
+
+            while let Some(chunk_result) = stream.next().await {
+                let chunk = chunk_result.unwrap();
+                download.write_all(&chunk).unwrap();
+            }
+
+            download.flush().unwrap();
+
+            let file_path = if file_type.starts_with("video/") {
+                let thumbnail_path = PathBuf::from(&base_dir).join(format!("{}-thumbnail.avif", file_hash));
+                File::create(&thumbnail_path).await.unwrap();
+                get_thumbnail_image(download.path().to_str().unwrap(), &thumbnail_path, "image/avif", "video").await
+            } else if file_type == "image/apng" || file_type == "image/gif" {
+                let thumbnail_path = PathBuf::from(&base_dir).join(format!("{}-thumbnail.webp", file_hash));
+                File::create(&thumbnail_path).await.unwrap();
+                get_thumbnail_image(download.path().to_str().unwrap(), &thumbnail_path, "image/webp", "animated").await
+            } else {
+                let thumbnail_path = PathBuf::from(&base_dir).join(format!("{}-thumbnail.avif", file_hash));
+                File::create(&thumbnail_path).await.unwrap();
+                get_thumbnail_image(download.path().to_str().unwrap(), &thumbnail_path, "image/avif", "image").await
+            };
+
+            file_path
+        };
+
+        NamedFile::open(file_path).map_err(|e| {
+            eprintln!("{}", e);
+            error::ErrorInternalServerError(format!("Error: {}", e))
+        })
     } else {
-        return HttpResponse::new(StatusCode::BAD_GATEWAY);
-    }
+        return Err(error::ErrorBadGateway("thumbnail failed".to_string()));
+    };
 }
 
 #[actix_web::main]

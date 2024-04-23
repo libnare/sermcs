@@ -16,6 +16,7 @@ lazy_static! {
 pub struct AppState {
     pub db_pool: Pool<Postgres>,
     pub http_client: HttpClient,
+    pub temp_dir: String,
 }
 
 #[derive(Debug, Clone)]
@@ -73,7 +74,8 @@ impl AppState {
 
         Self {
             db_pool: pool,
-            http_client: HTTP_CLIENT.clone()
+            http_client: HTTP_CLIENT.clone(),
+            temp_dir: env::var("SERMCS_TEMP_DIR").unwrap(),
         }
     }
 }
