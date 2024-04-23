@@ -155,7 +155,7 @@ async fn detail(key: web::Path<(String, )>, data: Data<AppState>) -> Result<Name
         }
     } else if is_thumbnail {
         let file_hash = xxh3_64(format!("{}-thumbnail", key).as_ref());
-        let base_dir = env::var("SERMCS_TEMP_DIR").unwrap_or_else(|_| "C:\\Users\\Iris\\Downloads\\sermcs-temp".to_string());
+        let base_dir = &data.temp_dir;
 
         let file_path_avif = PathBuf::from(&base_dir).join(format!("{}-thumbnail.avif", file_hash));
         let file_path_webp = PathBuf::from(&base_dir).join(format!("{}-thumbnail.webp", file_hash));
