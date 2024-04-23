@@ -75,7 +75,7 @@ impl AppState {
         Self {
             db_pool: pool,
             http_client: HTTP_CLIENT.clone(),
-            temp_dir: env::var("SERMCS_TEMP_DIR").unwrap(),
+            temp_dir: env::var("SERMCS_DIR").unwrap(),
         }
     }
 }
